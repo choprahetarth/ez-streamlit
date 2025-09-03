@@ -1,32 +1,41 @@
 #!/usr/bin/env python3
 """
-Streamlit chat frontend for SSE client.
-Run: streamlit run streamlit_chat.py
+Streamlit Chat Frontend for SSE API
+Run with: streamlit run streamlit_chat.py
 """
 
-import json
 import streamlit as st
+import json
 import urllib.request
 import urllib.error
-from typing import Dict, List, Optional
+from typing import Generator
 
-# Configuration
-TARGET_URL = "http://98.80.0.197:8003/v1/chat/completions"
-TOKEN = None  # Set your token here if needed
+# ---------- API CONFIGURATION ----------
+API_URL = "http://98.80.0.197:8003/v1/chat/completions"
+MODEL_NAME = "casperhansen/llama-3.3-70b-instruct-awq"
+MAX_TOKENS = 500  # Default max tokens
+TOKEN = None  # Set to "sk-..." if needed
 
-# Headers for the request
+# Default headers for SSE
 HEADERS = {
     "Accept": "text/event-stream",
     "Cache-Control": "no-cache",
     "Content-Type": "application/json",
 }
 
-def send_sse_request(messages: List[Dict], model: str = "casperhansen/llama-3.3-70b-instruct-awq", max_tokens: int = 50) -> str:
-    """Send SSE request and return the complete response."""
-    
+# System prompt (developer role)
+SYSTEM_PROMPT = "You are a helpful assistant. Be concise and clear in your responses."
+# ---------- /API CONFIGURATION ----------
+
+
+def stream_response(messages: list, max_tokens: int = MAX_TOKENS) -> Generator[str, None, None]:
+    """
+    Stream response from the SSE API.
+    Yields text chunks as they arrive.
+    """
     # Prepare request body
     request_body = {
-        "model": model,
+        "model": MODEL_NAME,
         "messages": messages,
         "stream": True,
         "max_completion_tokens": max_tokens,
@@ -41,21 +50,14 @@ def send_sse_request(messages: List[Dict], model: str = "casperhansen/llama-3.3-
     data_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
     
     req = urllib.request.Request(
-        TARGET_URL, data=data_bytes, headers=headers, method="POST"
+        API_URL, data=data_bytes, headers=headers, method="POST"
     )
     
     try:
         with urllib.request.urlopen(req) as resp:
-            ctype = (resp.getheader("content-type") or "").split(";")[0].strip()
-            if ctype != "text/event-stream":
-                st.warning(f"Warning: response content-type is {ctype!r}, not 'text/event-stream'")
-            
             data_lines = []
-            event_name = None
-            event_id = None
-            full_response = ""
             
-            # Read line-by-line until server closes
+            # Read line-by-line
             while True:
                 raw = resp.readline()
                 if not raw:  # connection closed
@@ -64,104 +66,98 @@ def send_sse_request(messages: List[Dict], model: str = "casperhansen/llama-3.3-
                 
                 # SSE framing per spec
                 if line == "":
-                    # Dispatch one event
-                    if data_lines or event_name or event_id:
+                    # Process accumulated data lines
+                    if data_lines:
                         payload = "\n".join(data_lines)
                         data_lines.clear()
                         
+                        # Check for end of stream
                         if payload == "[DONE]":
-                            return full_response
+                            return
                         
-                        # Parse the JSON response
+                        # Try to parse JSON and extract content
                         try:
-                            response_obj = json.loads(payload)
-                            if "choices" in response_obj and len(response_obj["choices"]) > 0:
-                                delta = response_obj["choices"][0].get("delta", {})
-                                if "content" in delta:
-                                    full_response += delta["content"]
+                            data = json.loads(payload)
+                            # Extract content from OpenAI-style response
+                            if "choices" in data and len(data["choices"]) > 0:
+                                choice = data["choices"][0]
+                                if "delta" in choice and "content" in choice["delta"]:
+                                    content = choice["delta"]["content"]
+                                    if content:
+                                        yield content
                         except json.JSONDecodeError:
-                            pass
-                        
-                        event_name = None
-                        event_id = None
+                            pass  # Skip non-JSON lines
                     continue
                 
+                # Skip comments
                 if line.startswith(":"):
-                    # Comment / ping; ignore
                     continue
                 
+                # Collect data lines
                 if line.startswith("data:"):
                     data_lines.append(line[5:].lstrip())
-                elif line.startswith("event:"):
-                    event_name = line[6:].lstrip()
-                elif line.startswith("id:"):
-                    event_id = line[3:].lstrip()
-            
-            # Flush any trailing event
-            if data_lines or event_name or event_id:
-                payload = "\n".join(data_lines)
-                if payload != "[DONE]":
-                    try:
-                        response_obj = json.loads(payload)
-                        if "choices" in response_obj and len(response_obj["choices"]) > 0:
-                            delta = response_obj["choices"][0].get("delta", {})
-                            if "content" in delta:
-                                full_response += delta["content"]
-                    except json.JSONDecodeError:
-                        pass
-            
-            return full_response
-    
+                    
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        st.error(f"HTTP {e.code} {e.reason}\n{body}")
-        return ""
+        yield f"❌ Error: HTTP {e.code} {e.reason}\n{body}"
     except urllib.error.URLError as e:
-        st.error(f"Connection error: {e}")
-        return ""
+        yield f"❌ Connection error: {e}"
+    except Exception as e:
+        yield f"❌ Unexpected error: {e}"
+
 
 def main():
+    # Page configuration
     st.set_page_config(
-        page_title="Chat with Llama 3.3 70B",
-        page_icon="��",
+        page_title="Chat with LLM",
+        page_icon="💬",
         layout="wide"
     )
     
-    st.title("�� Chat with Llama 3.3 70B")
-    st.caption("Powered by casperhansen/llama-3.3-70b-instruct-awq")
+    # Title and description
+    st.title("💬 LLM Chat Interface")
+    st.markdown(f"Connected to: `{API_URL}`")
+    st.markdown(f"Model: `{MODEL_NAME}`")
     
-    # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    # Sidebar for configuration
+    # Sidebar for settings
     with st.sidebar:
-        st.header("Configuration")
+        st.header("⚙️ Settings")
         
-        model = st.selectbox(
-            "Model",
-            ["casperhansen/llama-3.3-70b-instruct-awq"],
-            help="Select the model to use"
-        )
-        
+        # Max tokens slider
         max_tokens = st.slider(
-            "Max Tokens",
-            min_value=10,
-            max_value=1000,
-            value=50,
+            "Max Completion Tokens",
+            min_value=50,
+            max_value=2000,
+            value=MAX_TOKENS,
+            step=50,
             help="Maximum number of tokens to generate"
         )
         
-        # Add system message option
-        system_message = st.text_area(
-            "System Message",
-            value="Don't say vulgarities",
-            help="Instructions for the AI assistant"
+        # System prompt editor
+        system_prompt = st.text_area(
+            "System Prompt",
+            value=SYSTEM_PROMPT,
+            height=100,
+            help="This prompt is sent as the 'developer' role message"
         )
         
-        if st.button("Clear Chat"):
+        # Clear conversation button
+        if st.button("🗑️ Clear Conversation", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
+        
+        st.divider()
+        
+        # Display conversation stats
+        if "messages" in st.session_state:
+            user_msgs = sum(1 for m in st.session_state.messages if m["role"] == "user")
+            assistant_msgs = sum(1 for m in st.session_state.messages if m["role"] == "assistant")
+            st.metric("User Messages", user_msgs)
+            st.metric("Assistant Messages", assistant_msgs)
+    
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
     
     # Display chat messages
     for message in st.session_state.messages:
@@ -169,17 +165,7 @@ def main():
             st.markdown(message["content"])
     
     # Chat input
-    if prompt := st.chat_input("What would you like to chat about?"):
-        # Prepare messages with system message
-        messages = [{"role": "developer", "content": system_message}]
-        
-        # Add conversation history
-        for msg in st.session_state.messages:
-            messages.append(msg)
-        
-        # Add current user message
-        messages.append({"role": "user", "content": prompt})
-        
+    if prompt := st.chat_input("Type your message here..."):
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
         
@@ -187,37 +173,44 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Generate assistant response
+        # Display assistant response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = send_sse_request(messages, model, max_tokens)
+            message_placeholder = st.empty()
+            full_response = ""
             
-            if response:
-                st.markdown(response)
-                # Add assistant response to chat history
-                st.session_state.messages.append({"role": "assistant", "content": response})
-            else:
-                st.error("Failed to get response from the server")
+            # Prepare messages for API (including system prompt)
+            api_messages = [{"role": "developer", "content": system_prompt}]
+            api_messages.extend(st.session_state.messages)
+            
+            # Stream the response
+            try:
+                for chunk in stream_response(api_messages, max_tokens):
+                    full_response += chunk
+                    # Update the placeholder with accumulated response
+                    message_placeholder.markdown(full_response + "▌")
+                
+                # Final update without cursor
+                message_placeholder.markdown(full_response)
+                
+            except Exception as e:
+                full_response = f"❌ Error: {str(e)}"
+                message_placeholder.markdown(full_response)
+            
+            # Add assistant response to chat history
+            if full_response and not full_response.startswith("❌"):
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
     
-    # Display connection info
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(f"**Endpoint:** `{TARGET_URL}`")
-    st.sidebar.markdown(f"**Messages:** {len(st.session_state.messages)}")
-    
-    # Add some example prompts
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Example Prompts:**")
-    example_prompts = [
-        "Explain quantum computing in simple terms",
-        "Write a short poem about AI",
-        "Help me debug this Python code",
-        "What's the weather like today?"
-    ]
-    
-    for example in example_prompts:
-        if st.sidebar.button(example, key=f"example_{example}"):
-            st.session_state.messages.append({"role": "user", "content": example})
-            st.rerun()
+    # Footer with connection status
+    with st.container():
+        st.divider()
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.caption("🟢 Connected to SSE API")
+        with col2:
+            st.caption(f"Model: {MODEL_NAME.split('/')[-1]}")
+        with col3:
+            st.caption(f"Max Tokens: {max_tokens}")
+
 
 if __name__ == "__main__":
     main()
