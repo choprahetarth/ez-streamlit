@@ -11,7 +11,7 @@ import urllib.error
 from typing import Dict, List, Optional
 
 # Configuration
-TARGET_URL = "http://98.80.0.197:8000/v1/chat/completions"
+TARGET_URL = "http://98.80.0.197:8003/v1/chat/completions"
 TOKEN = None  # Set your token here if needed
 
 # Headers for the request
@@ -21,7 +21,7 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-def send_sse_request(messages: List[Dict], model: str = "meta-llama/Llama-3.2-1B-Instruct", max_tokens: int = 50) -> str:
+def send_sse_request(messages: List[Dict], model: str = "casperhansen/llama-3.3-70b-instruct-awq", max_tokens: int = 50) -> str:
     """Send SSE request and return the complete response."""
     
     # Prepare request body
@@ -122,13 +122,13 @@ def send_sse_request(messages: List[Dict], model: str = "meta-llama/Llama-3.2-1B
 
 def main():
     st.set_page_config(
-        page_title="Chat with Llama",
+        page_title="Chat with Llama 3.3 70B",
         page_icon="��",
         layout="wide"
     )
     
-    st.title("�� Chat with Llama 3.2")
-    st.caption("Powered by your SSE endpoint")
+    st.title("�� Chat with Llama 3.3 70B")
+    st.caption("Powered by casperhansen/llama-3.3-70b-instruct-awq")
     
     # Initialize session state
     if "messages" not in st.session_state:
@@ -140,16 +140,23 @@ def main():
         
         model = st.selectbox(
             "Model",
-            ["meta-llama/Llama-3.2-1B-Instruct"],
+            ["casperhansen/llama-3.3-70b-instruct-awq"],
             help="Select the model to use"
         )
         
         max_tokens = st.slider(
             "Max Tokens",
             min_value=10,
-            max_value=500,
+            max_value=1000,
             value=50,
             help="Maximum number of tokens to generate"
+        )
+        
+        # Add system message option
+        system_message = st.text_area(
+            "System Message",
+            value="Don't say vulgarities",
+            help="Instructions for the AI assistant"
         )
         
         if st.button("Clear Chat"):
@@ -163,6 +170,16 @@ def main():
     
     # Chat input
     if prompt := st.chat_input("What would you like to chat about?"):
+        # Prepare messages with system message
+        messages = [{"role": "developer", "content": system_message}]
+        
+        # Add conversation history
+        for msg in st.session_state.messages:
+            messages.append(msg)
+        
+        # Add current user message
+        messages.append({"role": "user", "content": prompt})
+        
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
         
@@ -173,7 +190,7 @@ def main():
         # Generate assistant response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = send_sse_request(st.session_state.messages, model, max_tokens)
+                response = send_sse_request(messages, model, max_tokens)
             
             if response:
                 st.markdown(response)
@@ -186,6 +203,21 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**Endpoint:** `{TARGET_URL}`")
     st.sidebar.markdown(f"**Messages:** {len(st.session_state.messages)}")
+    
+    # Add some example prompts
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Example Prompts:**")
+    example_prompts = [
+        "Explain quantum computing in simple terms",
+        "Write a short poem about AI",
+        "Help me debug this Python code",
+        "What's the weather like today?"
+    ]
+    
+    for example in example_prompts:
+        if st.sidebar.button(example, key=f"example_{example}"):
+            st.session_state.messages.append({"role": "user", "content": example})
+            st.rerun()
 
 if __name__ == "__main__":
     main()
