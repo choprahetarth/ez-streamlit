@@ -6,8 +6,7 @@ Run with: streamlit run streamlit_chat.py
 
 import streamlit as st
 import json
-import urllib.request
-import urllib.error
+import httpx
 from typing import Generator, List, Dict
 
 # ---------- API CONFIGURATION ----------
@@ -79,7 +78,7 @@ def trim_conversation_history(messages: List[Dict], max_messages: int, max_token
 
 def stream_response(messages: list, max_tokens: int = MAX_TOKENS) -> Generator[str, None, None]:
     """
-    Stream response from the SSE API.
+    Stream response from the SSE API using httpx with proper connection management.
     Yields text chunks as they arrive.
     """
     # Trim conversation history to prevent context overflow
@@ -100,66 +99,84 @@ def stream_response(messages: list, max_tokens: int = MAX_TOKENS) -> Generator[s
     if TOKEN:
         headers["Authorization"] = f"Bearer {TOKEN}"
     
-    # Encode JSON body
-    data_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+    # Use httpx with explicit connection management
+    # Create a new client for each request to ensure clean state
+    transport = httpx.HTTPTransport(retries=0)  # No retries, clean connection
     
-    # Add timeout to prevent hanging
-    req = urllib.request.Request(
-        API_URL, data=data_bytes, headers=headers, method="POST"
-    )
-    
-    try:
-        # Add timeout to prevent hanging
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data_lines = []
-            
-            # Read line-by-line
-            while True:
-                raw = resp.readline()
-                if not raw:  # connection closed
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+    with httpx.Client(
+        transport=transport,
+        timeout=httpx.Timeout(30.0, connect=5.0),  # 30s read, 5s connect timeout
+        limits=httpx.Limits(max_connections=1, max_keepalive_connections=0)  # No connection pooling
+    ) as client:
+        
+        try:
+            # Stream the response
+            with client.stream(
+                'POST', 
+                API_URL, 
+                json=request_body, 
+                headers=headers
+            ) as response:
+                response.raise_for_status()
                 
-                # SSE framing per spec
-                if line == "":
-                    # Process accumulated data lines
-                    if data_lines:
-                        payload = "\n".join(data_lines)
-                        data_lines.clear()
-                        
-                        # Check for end of stream
-                        if payload == "[DONE]":
-                            return
-                        
-                        # Try to parse JSON and extract content
-                        try:
-                            data = json.loads(payload)
-                            # Extract content from OpenAI-style response
-                            if "choices" in data and len(data["choices"]) > 0:
-                                choice = data["choices"][0]
-                                if "delta" in choice and "content" in choice["delta"]:
-                                    content = choice["delta"]["content"]
-                                    if content:
-                                        yield content
-                        except json.JSONDecodeError:
-                            pass  # Skip non-JSON lines
-                    continue
+                data_lines = []
                 
-                # Skip comments
-                if line.startswith(":"):
-                    continue
-                
-                # Collect data lines
-                if line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip())
+                # Process SSE stream line by line
+                for line in response.iter_lines():
+                    # SSE framing per spec
+                    if line == "":
+                        # Process accumulated data lines
+                        if data_lines:
+                            payload = "\n".join(data_lines)
+                            data_lines.clear()
+                            
+                            # Check for end of stream
+                            if payload == "[DONE]":
+                                # Explicitly close and return
+                                response.close()
+                                return
+                            
+                            # Try to parse JSON and extract content
+                            try:
+                                data = json.loads(payload)
+                                # Extract content from OpenAI-style response
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    choice = data["choices"][0]
+                                    if "delta" in choice and "content" in choice["delta"]:
+                                        content = choice["delta"]["content"]
+                                        if content:
+                                            yield content
+                            except json.JSONDecodeError:
+                                pass  # Skip non-JSON lines
+                        continue
                     
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        yield f"❌ Error: HTTP {e.code} {e.reason}\n{body}"
-    except urllib.error.URLError as e:
-        yield f"❌ Connection error: {e}"
-    except Exception as e:
-        yield f"❌ Unexpected error: {e}"
+                    # Skip comments
+                    if line.startswith(":"):
+                        continue
+                    
+                    # Collect data lines
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                
+                # Ensure response is closed after iteration completes
+                response.close()
+                        
+        except httpx.HTTPStatusError as e:
+            yield f"❌ Error: HTTP {e.response.status_code}\n{e.response.text}"
+        except httpx.ConnectTimeout:
+            yield f"❌ Connection timeout: Could not connect to {API_URL}"
+        except httpx.ReadTimeout:
+            yield f"❌ Read timeout: Server took too long to respond"
+        except httpx.RequestError as e:
+            yield f"❌ Connection error: {e}"
+        except Exception as e:
+            yield f"❌ Unexpected error: {e}"
+        finally:
+            # Ensure client is fully closed
+            try:
+                client.close()
+            except:
+                pass
 
 
 def main():
