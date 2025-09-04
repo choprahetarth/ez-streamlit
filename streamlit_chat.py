@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streamlit Chat Frontend for SSE API
+Streamlit Chat Frontend for SSE API with Context Management
 Run with: streamlit run streamlit_chat.py
 """
 
@@ -8,13 +8,17 @@ import streamlit as st
 import json
 import urllib.request
 import urllib.error
-from typing import Generator
+from typing import Generator, List, Dict
 
 # ---------- API CONFIGURATION ----------
 API_URL = "http://98.80.0.197:8003/v1/chat/completions"
 MODEL_NAME = "casperhansen/llama-3.3-70b-instruct-awq"
 MAX_TOKENS = 500  # Default max tokens
 TOKEN = None  # Set to "sk-..." if needed
+
+# Context management settings
+MAX_CONTEXT_MESSAGES = 10  # Keep only last N messages (user + assistant pairs)
+CONTEXT_WINDOW_TOKENS = 4000  # Rough estimate of model's context window
 
 # Default headers for SSE
 HEADERS = {
@@ -28,15 +32,65 @@ SYSTEM_PROMPT = "You are a helpful assistant. Be concise and clear in your respo
 # ---------- /API CONFIGURATION ----------
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough estimation of tokens (4 chars ≈ 1 token)"""
+    return len(text) // 4
+
+
+def trim_conversation_history(messages: List[Dict], max_messages: int, max_tokens: int) -> List[Dict]:
+    """
+    Trim conversation history to stay within limits.
+    Keeps system message and most recent exchanges.
+    """
+    if not messages:
+        return messages
+    
+    # Always keep system/developer messages at the start
+    system_messages = []
+    conversation_messages = []
+    
+    for msg in messages:
+        if msg["role"] in ["system", "developer"]:
+            system_messages.append(msg)
+        else:
+            conversation_messages.append(msg)
+    
+    # If we have too many conversation messages, keep only the most recent ones
+    if len(conversation_messages) > max_messages:
+        # Keep pairs (user + assistant), so ensure even number
+        keep_count = max_messages
+        if keep_count % 2 == 1:
+            keep_count -= 1
+        conversation_messages = conversation_messages[-keep_count:]
+    
+    # Estimate total tokens and trim further if needed
+    all_messages = system_messages + conversation_messages
+    total_tokens = sum(estimate_tokens(msg["content"]) for msg in all_messages)
+    
+    # If still too many tokens, aggressively trim conversation
+    while total_tokens > max_tokens and len(conversation_messages) > 2:
+        # Remove oldest pair (user + assistant)
+        conversation_messages = conversation_messages[2:]
+        all_messages = system_messages + conversation_messages
+        total_tokens = sum(estimate_tokens(msg["content"]) for msg in all_messages)
+    
+    return all_messages
+
+
 def stream_response(messages: list, max_tokens: int = MAX_TOKENS) -> Generator[str, None, None]:
     """
     Stream response from the SSE API.
     Yields text chunks as they arrive.
     """
+    # Trim conversation history to prevent context overflow
+    trimmed_messages = trim_conversation_history(
+        messages, MAX_CONTEXT_MESSAGES, CONTEXT_WINDOW_TOKENS
+    )
+    
     # Prepare request body
     request_body = {
         "model": MODEL_NAME,
-        "messages": messages,
+        "messages": trimmed_messages,
         "stream": True,
         "max_completion_tokens": max_tokens,
     }
@@ -49,12 +103,14 @@ def stream_response(messages: list, max_tokens: int = MAX_TOKENS) -> Generator[s
     # Encode JSON body
     data_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
     
+    # Add timeout to prevent hanging
     req = urllib.request.Request(
         API_URL, data=data_bytes, headers=headers, method="POST"
     )
     
     try:
-        with urllib.request.urlopen(req) as resp:
+        # Add timeout to prevent hanging
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data_lines = []
             
             # Read line-by-line
@@ -133,6 +189,26 @@ def main():
             help="Maximum number of tokens to generate"
         )
         
+        # Context management settings
+        st.subheader("Context Management")
+        max_context = st.slider(
+            "Max Context Messages",
+            min_value=2,
+            max_value=20,
+            value=MAX_CONTEXT_MESSAGES,
+            step=2,
+            help="Maximum number of recent messages to keep in context"
+        )
+        
+        context_tokens = st.slider(
+            "Context Window (tokens)",
+            min_value=1000,
+            max_value=8000,
+            value=CONTEXT_WINDOW_TOKENS,
+            step=500,
+            help="Rough token limit for conversation context"
+        )
+        
         # System prompt editor
         system_prompt = st.text_area(
             "System Prompt",
@@ -152,8 +228,16 @@ def main():
         if "messages" in st.session_state:
             user_msgs = sum(1 for m in st.session_state.messages if m["role"] == "user")
             assistant_msgs = sum(1 for m in st.session_state.messages if m["role"] == "assistant")
+            total_chars = sum(len(m["content"]) for m in st.session_state.messages)
+            estimated_tokens = estimate_tokens(" ".join(m["content"] for m in st.session_state.messages))
+            
             st.metric("User Messages", user_msgs)
             st.metric("Assistant Messages", assistant_msgs)
+            st.metric("Estimated Tokens", estimated_tokens)
+            
+            # Warning if approaching limits
+            if estimated_tokens > context_tokens * 0.8:
+                st.warning("⚠️ Approaching token limit. Consider clearing conversation.")
     
     # Initialize chat history
     if "messages" not in st.session_state:
@@ -203,13 +287,27 @@ def main():
     # Footer with connection status
     with st.container():
         st.divider()
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.caption("🟢 Connected to SSE API")
         with col2:
             st.caption(f"Model: {MODEL_NAME.split('/')[-1]}")
         with col3:
             st.caption(f"Max Tokens: {max_tokens}")
+        with col4:
+            # Show current context size
+            if "messages" in st.session_state:
+                current_tokens = estimate_tokens(" ".join(m["content"] for m in st.session_state.messages))
+                st.caption(f"Context: {current_tokens} tokens")
+
+
+# Update global variables based on sidebar settings
+def update_globals():
+    global MAX_CONTEXT_MESSAGES, CONTEXT_WINDOW_TOKENS
+    if 'max_context' in locals():
+        MAX_CONTEXT_MESSAGES = max_context
+    if 'context_tokens' in locals():
+        CONTEXT_WINDOW_TOKENS = context_tokens
 
 
 if __name__ == "__main__":
